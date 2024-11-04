@@ -1,0 +1,3 @@
+[submodule "mae_main"]
+	path = mae_main
+	url = https://github.com/facebookresearch/mae.git
