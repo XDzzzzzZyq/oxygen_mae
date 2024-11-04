@@ -1,3 +1,6 @@
 [submodule "mae_main"]
 	path = mae_main
 	url = https://github.com/facebookresearch/mae.git
+[submodule "SatMAE_main"]
+	path = SatMAE_main
+	url = https://github.com/sustainlab-group/SatMAE.git
