@@ -178,7 +178,11 @@ class MaskedAutoencoderViT(nn.Module):
         xx = self.patchify(xx)
         xx = self.patch_embed(xx)
         loc = self.patch_embed_loc(loc)
-        dys = self.patch_embed_day(dys)[None, :].repeat(xx.shape[0], 1)
+        dys = self.patch_embed_day(dys)
+
+        # in training, data in a batch has the same dys
+        if dys.shape[0] != xx.shape[0]:
+            dys = dys[None, :].repeat(xx.shape[0], 1)
 
         # add pos embed w/o cls token
         if self.pos_embed.device != xx.device:
@@ -248,8 +252,9 @@ class MaskedAutoencoderViT(nn.Module):
 
         # prediction
         xx = xx[:, self.pre_num:(-um_count), :].reshape((n, self.h**2, -1, self.decoder_embed_dim))
-        xx = [self.decoder_pred[col](xx[:, :, self.mask_chn_idx[col], :])
-              for col in self.mask_chn_name]
+        xx = [self.decoder_pred[col](xx[:, :, ii:(ii+1), :])
+              for col in self.mask_chn_name
+              for ii in torch.where(self.mask_chn_idx[col])[0]]
         return torch.cat(xx, dim=2)
 
     # -----------------------#
@@ -257,8 +262,8 @@ class MaskedAutoencoderViT(nn.Module):
     # img: [N, L, channel]
     # -----------------------#
     def normalize(self, img):
-        self.mean = self.mean.to(img.device)
-        self.std = self.std.to(img.device)
+        self.mean = self.mean.to(img.device).to(torch.float)
+        self.std = self.std.to(img.device).to(torch.float)
         return (img - self.mean[None, None, :]) / (self.std[None, None, :] + 1e-6)
 
     def get_cls_idx(self, img):

@@ -13,7 +13,9 @@ import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from torch.nn.parallel import DistributedDataParallel
+import timm.optim.optim_factory as optim_factory
 import mae_main.util.misc as misc
+from mae_main.util import lr_sched
 from dataclasses import dataclass
 
 from functools import partial
@@ -76,21 +78,26 @@ def main(args):
     )
 
     # define ddp model
-    model = DistributedDataParallel(args.model.to(args.gpu), device_ids=[args.gpu])
+    model = DistributedDataParallel(args.model.to(args.gpu), device_ids=[args.gpu], find_unused_parameters=True)
 
-    # following timm: set wd as 0 for bias and norm layers
-    optimizer = torch.optim.AdamW(model.module.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=0.1)
+    # only regularize the slope
+    param_groups = optim_factory.param_groups_weight_decay(model.module, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
 
     # loss scaler for mixed precision
     loss_scaler = torch.amp.GradScaler()
 
+    # resume from previous training
+    if args.resume:
+        print('resume previous training!!!')
+        misc.load_model(args=args, model_without_ddp=model.module, optimizer=optimizer, loss_scaler=loss_scaler)
+
     start_time = time.time()
     accs = []
-    for epoch in range(0, args.epochs):
+    for epoch in range(args.start_epoch, args.epochs):
         data_loader_train.sampler.set_epoch(epoch)
         loss = simple_train_one_epoch(model, data_loader_train,
-                                      optimizer, args, loss_scaler)
+                                      optimizer, args, loss_scaler, epoch)
         misc.save_model(args=args, model=model, model_without_ddp=model.module, optimizer=optimizer,
                         loss_scaler=loss_scaler, epoch=epoch)
         loss_val = validate_model(model, data_loader_val, args)
@@ -100,31 +107,35 @@ def main(args):
         if misc.get_rank() == 0:
             with open(args.output_dir + "/accuracy{}.log".format(epoch), 'wb') as h:
                 pickle.dump(accs, h)
-        scheduler.step()
     print('Training time {}'.format(time.time() - start_time))
 
 
 # ------------------- #
 # Training for one epoch
 # ------------------- #
-def simple_train_one_epoch(model, data_loader, optimizer, arg, loss_scaler):
+def simple_train_one_epoch(model, data_loader, optimizer, args, loss_scaler, epoch):
     metric_logger = misc.MetricLogger()
     model.train()
     for ep, dt in enumerate(data_loader):
+        # adjust learning rate
+        lr_sched.adjust_learning_rate(optimizer, ep / len(data_loader) + epoch, args)
+
+        # get data
         dt = utils.sat_preprocess_per_batch(dt[0][0], dt[0][1])
         img = dt[0]
         loc = dt[1].to(torch.float)
-        dys = dt[2].to(arg.gpu, non_blocking=True).to(torch.float)
+        dys = dt[2].to(args.gpu, non_blocking=True).to(torch.float)
         n = img.shape[0]
         idx = torch.randperm(n)
         img = img[idx, :, :, :]
         loc = loc[idx, :]
-        for ii in range(0, 100 * args.batch_size_in, args.batch_size_in):
-            optimizer.zero_grad()
-            img_t = img[ii: (ii+args.batch_size_in), :, :, :].to(arg.gpu, non_blocking=True)
-            loc_t = loc[ii: (ii+args.batch_size_in), :].to(arg.gpu, non_blocking=True)
+
+        # loop the data
+        for ii in range(0, args.batch_per_epoch * args.batch_size_in, args.batch_size_in):
+            img_t = img[ii: (ii+args.batch_size_in), :, :, :].to(args.gpu, non_blocking=True)
+            loc_t = loc[ii: (ii+args.batch_size_in), :].to(args.gpu, non_blocking=True)
             with torch.autocast(enabled=False, device_type='cuda'):
-                loss, _, _ = model((img_t, loc_t, dys), arg.mask_ratio)
+                loss, _, _ = model((img_t, loc_t, dys), args.mask_ratio)
             loss_scaler.scale(loss).backward()
             loss_scaler.unscale_(optimizer)
             loss_scaler.step(optimizer)
@@ -151,7 +162,7 @@ def validate_model(model, data_loader, arg):
         idx = torch.randperm(n)
         img = img[idx, :, :, :]
         loc = loc[idx, :]
-        for ii in range(0, 100 * args.batch_size_in, args.batch_size_in):
+        for ii in range(0, args.batch_per_epoch * args.batch_size_in, args.batch_size_in):
             img_t = img[ii: (ii + args.batch_size_in), :, :, :].to(arg.gpu, non_blocking=True)
             loc_t = loc[ii: (ii + args.batch_size_in), :].to(arg.gpu, non_blocking=True)
             with torch.no_grad():
@@ -169,30 +180,37 @@ class Parameters:
     batch_size = 1
     epochs = 100
     batch_size_in = 512
+    batch_per_epoch = 100
 
     # Model parameters
     mask_ratio = 0.75
 
     # Optimizer parameters
-    lr = 1e-3
-    step_size = 20
+    lr = 1e-4
+    min_lr = 0
+    weight_decay = 0.01
+    warmup_epochs = 10
 
     # Dataset parameters
     data_path = '/data0/zuchuan/processed_data/'
     data_path_val = '/data0/zuchuan/processed_data_val/'
-    output_dir = '/data0/zuchuan/mae_output_l16d128'
-    log_dir = '/data0/zuchuan/mae_output_l16d128'
+    output_dir = '/data0/zuchuan/mae_output_l32d128'
+    log_dir = '/data0/zuchuan/mae_output_l32d128'
     device = "cuda" if torch.cuda.is_available() else "cpu"
     seed = 0
+
+    # resume previous training
+    resume = "/data0/zuchuan/mae_output_l32d128/checkpoint-50.pth"
+    start_epoch = 50
 
     # distributive
     num_workers = 2
     pin_mem = True
 
     # model dimension
-    enc_depth = 16
+    enc_depth = 32
     enc_dim = 128
-    dec_depth = 8
+    dec_depth = 6
     dec_dim = 64
 
     def __init__(self, dt_meta):
@@ -215,7 +233,7 @@ class Parameters:
             decoder_embed_dim=self.dec_dim, decoder_depth=self.dec_depth, decoder_num_heads=8,
             mlp_ratio=4, num_embeddings=emb_num,
             mask_chn_idx=mask_chn_idx, mask_chn_name=['SST', 'CHL'], cls=False,
-            mean=dt_meta['MEAN'], std=dt_meta['STD'],
+            mean=dt_meta['NAN_MEAN'], std=dt_meta['NAN_STD'],
             norm_layer=partial(nn.LayerNorm, eps=1e-6))
 
 

@@ -122,17 +122,24 @@ def random_masking_lc(self, xx, mask_ratio):
 # -----------------------#
 def random_masking_lc_cond(xx, mask_ratio, mask_cond):
     n, l, c, d = xx.shape
+    # masked columns
     xx_masked = xx[:, :, mask_cond, :].reshape((n, -1, d))
+    if mask_ratio > 0:
+        x_masked, mask, ids_restore = random_masking(xx_masked, mask_ratio)
+    else:
+        x_masked = xx_masked
+        mask = torch.zeros_like(xx_masked)
+        ids_restore = 0
+
+    # appended unmasked columns
     xx_unm = xx[:, :, ~mask_cond, :].reshape((n, -1, d))
-    x_masked, mask, ids_restore = random_masking(xx_masked, mask_ratio)
     x_masked = torch.concat((x_masked, xx_unm), dim=1)
+
     return x_masked, mask, ids_restore
 
 
 # -----------------------#
-# Randomly mask length and channel
-# xx: [N, L, C, D]; batch, length, channel, dim
-# mask_cond: [C]; 0 unmasked, 1 masked
+# Data folder
 # -----------------------#
 class SatDataFolder(datasets.DatasetFolder):
     def __init__(self, root, loader, extensions=None, is_valid_file=None):
@@ -202,10 +209,12 @@ def sat_preprocess_per_batch(dt, name):
 # My dataset
 # -----------------------#
 class MyDataset(torch.utils.data.Dataset):
-    def __init__(self, x, y):
+    def __init__(self, x, y, locs, dys):
         super().__init__()
         self.x = x
         self.y = y
+        self.locs = locs
+        self.dys = dys
 
     def __len__(self):
         return self.x.shape[0]
@@ -213,7 +222,7 @@ class MyDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
-        return self.x[idx], self.y[idx]
+        return self.x[idx], self.y[idx], self.locs[idx], self.dys[idx]
 
 
 # ------------------------ #
